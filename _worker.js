@@ -1,120 +1,152 @@
-// ========== 你只需要改这里 ==========
-const AUTH_ENABLED = true; // 开启密码验证
-const USER = "doney";      // 用户名
-const PASS = "dvub(tR6BO"; // 密码
-// ====================================
+// ========== 你自己配置 ==========
+const USER = "doney";          // 用户名
+const PASS = "dvub(tR6BO";  // 密码
+const USE_AUTH = true;         // 是否开启密码验证
+// ===============================
 
-let hub_host = "registry-1.docker.io";
-const auth_url = "https://auth.docker.io";
-let workers_url = "";
+addEventListener("fetch", event => {
+  event.respondWith(handleRequest(event.request));
+});
 
-const BLOCK_UA = ["netcraft", "python", "curl", "wget"];
+async function handleRequest(request) {
+  const url = new URL(request.url);
+  const authorization = request.headers.get("Authorization");
 
-function routeByHosts(host) {
-	const routes = {
-		"quay": "quay.io",
-		"gcr": "gcr.io",
-		"k8s-gcr": "k8s.gcr.io",
-		"k8s": "registry.k8s.io",
-		"ghcr": "ghcr.io",
-		"cloudsmith": "docker.cloudsmith.io",
-	};
-	if (host in routes) return [routes[host], false];
-	else return [hub_host, true];
+  // 认证
+  if (USE_AUTH) {
+    if (!authorization || !checkAuth(authorization)) {
+      return new Response("Unauthorized", {
+        status: 401,
+        headers: {
+          "WWW-Authenticate": "Basic realm=\"Docker Proxy\""
+        }
+      });
+    }
+  }
+
+  // 处理 Docker Registry v2 API
+  if (url.pathname === "/v2/") {
+    return handleV2Root(request);
+  }
+
+  // 代理 token 请求
+  if (url.pathname.includes("/token")) {
+    return proxyToken(request);
+  }
+
+  return proxyRequest(request);
 }
 
-const PREFLIGHT_INIT = {
-	headers: { "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS", "access-control-max-age": "1728000" },
-};
-
-function makeRes(body, status = 200, headers = {}) {
-	headers["access-control-allow-origin"] = "*";
-	return new Response(body, { status, headers });
+function checkAuth(auth) {
+  try {
+    const [user, pass] = atob(auth.split(" ")[1]).split(":");
+    return user === USER && pass === PASS;
+  } catch {
+    return false;
+  }
 }
 
-function checkAuth(authHeader) {
-	if (!AUTH_ENABLED) return true;
-	try {
-		const [type, b64] = authHeader.split(" ");
-		if (type !== "Basic") return false;
-		const [user, pass] = atob(b64).split(":");
-		return user === USER && pass === PASS;
-	} catch (e) {
-		return false;
-	}
+// 处理 /v2/ 根路径检查
+async function handleV2Root(request) {
+  const url = new URL(request.url);
+  const targetUrl = new URL("https://registry-1.docker.io/v2/");
+  
+  const response = await fetch(targetUrl.toString(), {
+    method: request.method,
+    headers: cleanHeaders(request.headers),
+    redirect: "follow"
+  });
+
+  const newResponse = new Response(response.body, response);
+  
+  // 替换认证头
+  const authHeader = newResponse.headers.get("Www-Authenticate");
+  if (authHeader) {
+    newResponse.set("Www-Authenticate", authHeader.replace(/realm="[^"]*"/, `realm="${url.origin}/token"`));
+  }
+  
+  return newResponse;
 }
 
-export default {
-	async fetch(request, env) {
-		workers_url = `https://${new URL(request.url).hostname}`;
+async function proxyToken(request) {
+  const url = new URL(request.url);
+  
+  // 根据 service 参数决定目标认证服务器
+  const service = url.searchParams.get("service") || "registry.docker.io";
+  let authServer = "auth.docker.io";
+  
+  if (service.includes("ghcr.io")) authServer = "ghcr.io";
+  else if (service.includes("quay.io")) authServer = "quay.io";
+  else if (service.includes("gcr.io")) authServer = "gcr.io";
+  else if (service.includes("registry.k8s.io")) authServer = "registry.k8s.io";
 
-		// === 密码验证 ===
-		if (AUTH_ENABLED) {
-			const auth = request.headers.get("Authorization");
-			if (!auth || !checkAuth(auth)) {
-				return new Response("Unauthorized", {
-					status: 401,
-					headers: { "WWW-Authenticate": "Basic realm=\"Docker Proxy\"" },
-				});
-			}
-		}
+  const targetUrl = new URL(`https://${authServer}${url.pathname}${url.search}`);
+  const response = await fetch(targetUrl.toString(), {
+    method: request.method,
+    headers: cleanHeaders(request.headers),
+    body: request.body,
+    redirect: "follow"
+  });
 
-		const url = new URL(request.url);
-		const pathname = url.pathname;
-		const userAgent = (request.headers.get("User-Agent") || "").toLowerCase();
+  const newResponse = new Response(response.body, response);
+  const authHeader = newResponse.headers.get("Www-Authenticate");
+  
+  if (authHeader) {
+    newResponse.set("Www-Authenticate", authHeader.replace(/realm="https?:\/\/[^/"]+/g, `realm="${url.origin}`));
+  }
 
-		// 屏蔽爬虫
-		if (BLOCK_UA.some((u) => userAgent.includes(u))) {
-			return new Response("Forbidden", { status: 403 });
-		}
+  return newResponse;
+}
 
-		// 路由上游
-		const hostTop = url.hostname.split(".")[0];
-		const [upstream, fakePage] = routeByHosts(hostTop);
-		hub_host = upstream;
+async function proxyRequest(request) {
+  const url = new URL(request.url);
+  let targetHost = "registry-1.docker.io";
 
-		// 处理 token
-		if (pathname === "/token") {
-			const tokenUrl = auth_url + pathname + url.search;
-			const resp = await fetch(tokenUrl, request);
-			const newResp = new Response(resp.body, resp);
-			const authHeader = newResp.headers.get("Www-Authenticate");
-			if (authHeader) {
-				newResp.headers.set("Www-Authenticate", authHeader.replace(auth_url, workers_url));
-			}
-			return newResp;
-		}
+  const hostMap = {
+    "docker": "registry-1.docker.io",
+    "ghcr": "ghcr.io",
+    "quay": "quay.io",
+    "gcr": "gcr.io",
+    "k8s": "registry.k8s.io",
+    "k8s-gcr": "k8s.gcr.io"
+  };
 
-		// 处理首页
-		if (pathname === "/" && fakePage) {
-			return Response.redirect("https://hub.docker.com", 302);
-		}
+  // 路径前缀模式
+  const pathParts = url.pathname.split('/');
+  if (pathParts.length > 2 && hostMap[pathParts[1]]) {
+    targetHost = hostMap[pathParts[1]];
+    url.pathname = url.pathname.replace(`/${pathParts[1]}`, '');
+  }
 
-		// 转发真实请求
-		url.hostname = hub_host;
-		const newHeaders = new Headers(request.headers);
-		newHeaders.set("Host", hub_host);
+  // 子域名模式
+  const subdomain = url.hostname.split(".")[0];
+  if (hostMap[subdomain]) targetHost = hostMap[subdomain];
 
-		let resp = await fetch(url, {
-			method: request.method,
-			headers: newHeaders,
-			body: request.body,
-			redirect: "follow",
-		});
+  const targetUrl = new URL(`https://${targetHost}${url.pathname}${url.search}`);
+  const response = await fetch(targetUrl.toString(), {
+    method: request.method,
+    headers: cleanHeaders(request.headers),
+    body: request.body,
+    redirect: "follow"
+  });
 
-		// 处理重定向
-		if (resp.headers.get("Location")) {
-			return Response.redirect(resp.headers.get("Location"), 302);
-		}
+  const newResponse = new Response(response.body, response);
+  const authHeader = newResponse.headers.get("Www-Authenticate");
+  
+  if (authHeader) {
+    newResponse.set("Www-Authenticate", authHeader.replace(/realm="https?:\/\/[^/"]+/g, `realm="${url.origin}`));
+  }
 
-		// 修复认证域
-		const wwwAuth = resp.headers.get("Www-Authenticate");
-		if (wwwAuth) {
-			const newResp = new Response(resp.body, resp);
-			newResp.headers.set("Www-Authenticate", wwwAuth.replace(auth_url, workers_url));
-			return newResp;
-		}
+  return newResponse;
+}
 
-		return resp;
-	},
-};
+function cleanHeaders(headers) {
+  const h = new Headers(headers);
+  h.delete("Host");
+  h.delete("Origin");
+  h.delete("Referer");
+  if (!h.has("Accept")) {
+    h.set("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/json");
+  }
+  return h;
+}
